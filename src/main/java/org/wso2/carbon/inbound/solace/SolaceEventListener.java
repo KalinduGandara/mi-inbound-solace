@@ -45,6 +45,7 @@ import org.wso2.carbon.inbound.endpoint.protocol.generic.GenericEventBasedConsum
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.wso2.carbon.inbound.solace.SolaceUtils.getBooleanProperty;
 import static org.wso2.carbon.inbound.solace.SolaceUtils.getIntProperty;
@@ -75,6 +76,11 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
 
     // Lifecycle state — all access is synchronized on this instance
     private volatile boolean isConnected = false;
+
+    // Counts the sessions created by listen(). A failure reported for an earlier session is stale.
+    private volatile int sessionGeneration = 0;
+    // Terminal failure handler of the current session, shared by its event handlers and onException.
+    private volatile Runnable onTerminalFailure = () -> { };
 
     // Connection Configurations
     private final String host;
@@ -269,9 +275,12 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
         try {
             validateConnectionParameters();
 
+            int generation = ++sessionGeneration;
+            AtomicBoolean handled = new AtomicBoolean(false);
+            onTerminalFailure = () -> handleTerminalFailure(generation, handled);
             session = JCSMPFactory.onlyInstance().createSession(
                     buildJCSMPProperties(), null,
-                    new SolaceSessionEventHandler(name, this::destroy));
+                    new SolaceSessionEventHandler(name, onTerminalFailure));
             session.connect();
             isConnected = true;
 
@@ -366,7 +375,7 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
 
         ConsumerFlowProperties flowProps = buildFlowProperties(queue);
         flowReceiver = session.createFlow(this, flowProps, null,
-                new SolaceFlowEventHandler(name, this::destroy));
+                new SolaceFlowEventHandler(name, onTerminalFailure));
         flowReceiver.start();
         log.info("SolaceListener [" + name + "] consuming from queue: " + destinationName);
     }
@@ -419,7 +428,7 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
         flowProps.setNewSubscription(
                 JCSMPFactory.onlyInstance().createTopic(destinationName));
         flowReceiver = session.createFlow(this, flowProps, null,
-                new SolaceFlowEventHandler(name, this::destroy));
+                new SolaceFlowEventHandler(name, onTerminalFailure));
         flowReceiver.start();
         log.info("SolaceListener [" + name + "] consuming from DTE: " + dteName
                 + ", subscription: " + destinationName);
@@ -691,27 +700,69 @@ public class SolaceEventListener extends GenericEventBasedConsumer implements XM
 
     /**
      * Called by JCSMP when all internal reconnect retries are exhausted.
-     * Tears down the listener so the MI framework can trigger resume.
-     *
-     * <p>onException() runs on a JCSMP-managed callback thread. destroy() calls
-     * session.closeSession(), which waits for all active callbacks to return before it
-     * completes — including this one. Calling it inline would have the callback block on
-     * a shutdown that is itself waiting for the callback, a deadlock. The teardown is
-     * therefore dispatched to a short-lived daemon thread so onException() returns
-     * immediately (same approach as SolaceFlowEventHandler's FLOW_DOWN handling).
      */
     @Override
     public void onException(JCSMPException exception) {
         log.error("SolaceListener [" + name + "] encountered an error", exception);
-        Thread teardown = new Thread(() -> {
-            try {
-                destroy();
-            } catch (Exception e) {
-                log.error("Error while tearing down SolaceListener [" + name
-                        + "] after onException", e);
+        onTerminalFailure.run();
+    }
+
+    /**
+     * Handles a terminal failure reported by onException, session DOWN_ERROR or a terminal FLOW_DOWN:
+     * tears the listener down once and asks the MI inbound framework to call listen() again, which it
+     * keeps retrying until the listener is back. On MI versions without that support the listener stays
+     * down until the inbound endpoint is re-activated, as before.
+     *
+     * <p>A failure is bound to the session it was reported for. Several events for the same failure are
+     * handled once ({@code handled}), and a failure of a session that listen() has since replaced is
+     * ignored, while a failure of the replacement itself, even while it is still starting, is handled.
+     *
+     * <p>Failures are reported on JCSMP callback threads. destroy() calls session.closeSession(), which
+     * waits for all active callbacks to return — including the reporting one — so calling it inline
+     * would deadlock. The teardown therefore runs on a short-lived daemon thread.
+     */
+    private void handleTerminalFailure(int generation, AtomicBoolean handled) {
+        if (generation != sessionGeneration) {
+            if (log.isDebugEnabled()) {
+                log.debug("SolaceListener [" + name + "] ignoring a failure reported for an earlier session.");
             }
-        }, "solace-onexception-" + name);
-        teardown.setDaemon(true);
-        teardown.start();
+            return;
+        }
+        if (!handled.compareAndSet(false, true)) {
+            return;
+        }
+        Thread recovery = new Thread(() -> recover(generation), "solace-recovery-" + name);
+        recovery.setDaemon(true);
+        recovery.start();
+    }
+
+    /**
+     * Recovery worker for a failed session: tears the listener down, then asks the MI inbound framework
+     * to listen again. The generation is re-checked under the listener monitor immediately before
+     * destroy(), as this thread may only get to run after a deactivate/activate cycle has already
+     * replaced the failed session with a healthy one, which must not be closed.
+     */
+    void recover(int generation) {
+        try {
+            synchronized (this) {
+                if (generation != sessionGeneration) {
+                    log.info("SolaceListener [" + name + "] failed session was already replaced, "
+                            + "no recovery needed.");
+                    return;
+                }
+                destroy();
+            }
+            log.info("SolaceListener [" + name + "] requesting a restart from the MI inbound framework.");
+            try {
+                requestRelisten();
+            } catch (NoSuchMethodError e) {
+                // MI versions without requestRelisten(): keep the previous behaviour, the listener
+                // stays down until the inbound endpoint is re-activated.
+                log.warn("SolaceListener [" + name + "] cannot be restarted automatically on this MI "
+                        + "version. Re-activate the inbound endpoint to resume consumption.");
+            }
+        } catch (Exception e) {
+            log.error("Error while recovering SolaceListener [" + name + "]", e);
+        }
     }
 }
